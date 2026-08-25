@@ -86,6 +86,11 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
         self.ui.applyButton.clicked.connect(self.onApplyButton)
         self.ui.exportCsvButton.clicked.connect(self.onExportCsvButton)
 
+        if self.ui.inputVolumeSelector.currentNode() is None:
+            firstVolume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+            if firstVolume is not None:
+                self.ui.inputVolumeSelector.setCurrentNode(firstVolume)
+
         self._updateApplyButtonState()
 
     def cleanup(self):
@@ -108,21 +113,31 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
 
             seedButton = qt.QPushButton("Tohum yerleştir")
             seedButton.setCheckable(True)
+            seedButton.setToolTip(
+                "Birden fazla kez tıklayarak birden fazla tohum ekleyebilirsin "
+                "(örn. etmoid gibi tek parça olmayan sinüsler için)."
+            )
+
+            clearButton = qt.QPushButton("Temizle")
+            clearButton.setMaximumWidth(60)
 
             statusLabel = qt.QLabel("tohum yok")
-            statusLabel.setMinimumWidth(90)
+            statusLabel.setMinimumWidth(70)
 
             rowLayout.addWidget(checkbox)
             rowLayout.addWidget(seedButton)
+            rowLayout.addWidget(clearButton)
             rowLayout.addWidget(statusLabel)
             layout.addWidget(rowWidget)
 
             seedButton.clicked.connect(lambda checked, rid=region.id: self.onPlaceSeedClicked(rid, checked))
+            clearButton.clicked.connect(lambda checked=False, rid=region.id: self.onClearSeedsClicked(rid))
 
             self.regionWidgets[region.id] = {
                 "region": region,
                 "checkbox": checkbox,
                 "seedButton": seedButton,
+                "clearButton": clearButton,
                 "statusLabel": statusLabel,
                 "fiducialNode": None,
             }
@@ -156,15 +171,15 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
         widgets = self.regionWidgets[regionId]
         fiducialNode = widgets["fiducialNode"]
         if fiducialNode is None:
+            # No SetMaximumNumberOfControlPoints() call: some sinuses (ethmoid
+            # in particular) are several separate air cells rather than one
+            # cavity, so a region can need more than one seed.
             fiducialNode = slicer.mrmlScene.AddNewNodeByClass(
                 "vtkMRMLMarkupsFiducialNode", f"seed_{regionId}"
             )
-            fiducialNode.SetMaximumNumberOfControlPoints(1)
             fiducialNode.CreateDefaultDisplayNodes()
             fiducialNode.GetDisplayNode().SetSelectedColor(*widgets["region"].color_rgb)
             widgets["fiducialNode"] = fiducialNode
-        else:
-            fiducialNode.RemoveAllControlPoints()
 
         self.activePlacementRegionId = regionId
         self.placementObserverTag = fiducialNode.AddObserver(
@@ -174,25 +189,43 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
         selectionNode = slicer.mrmlScene.GetNodeByID("vtkMRMLSelectionNodeSingleton")
         selectionNode.SetActivePlaceNodeID(fiducialNode.GetID())
         interactionNode = slicer.mrmlScene.GetNodeByID("vtkMRMLInteractionNodeSingleton")
-        interactionNode.SetPlaceModePersistence(0)
+        # Persistent placement: stay in "place" mode after each click, so the
+        # user can add several seeds for one region without re-arming the button.
+        interactionNode.SetPlaceModePersistence(1)
         interactionNode.SetCurrentInteractionMode(interactionNode.Place)
 
-        widgets["statusLabel"].setText("tıklayın...")
+        self._updateSeedCountLabel(regionId)
 
     def _onSeedPlaced(self, caller, event):
         regionId = self.activePlacementRegionId
         if regionId is None:
             return
+        self._updateSeedCountLabel(regionId)
+
+    def _updateSeedCountLabel(self, regionId):
         widgets = self.regionWidgets[regionId]
-        widgets["statusLabel"].setText("tohum OK")
-        widgets["seedButton"].setChecked(False)
-        self._stopSeedPlacement()
+        fiducialNode = widgets["fiducialNode"]
+        count = fiducialNode.GetNumberOfControlPoints() if fiducialNode is not None else 0
+        widgets["statusLabel"].setText(f"{count} tohum" if count else "tıklayın...")
+
+    def onClearSeedsClicked(self, regionId):
+        widgets = self.regionWidgets[regionId]
+        if self.activePlacementRegionId == regionId:
+            self._stopSeedPlacement()
+            widgets["seedButton"].setChecked(False)
+        fiducialNode = widgets["fiducialNode"]
+        if fiducialNode is not None:
+            fiducialNode.RemoveAllControlPoints()
+        widgets["statusLabel"].setText("tohum yok")
 
     def _stopSeedPlacement(self):
         if self.activePlacementRegionId is not None:
             widgets = self.regionWidgets.get(self.activePlacementRegionId)
             if widgets is not None and widgets["fiducialNode"] is not None and self.placementObserverTag is not None:
                 widgets["fiducialNode"].RemoveObserver(self.placementObserverTag)
+            interactionNode = slicer.mrmlScene.GetNodeByID("vtkMRMLInteractionNodeSingleton")
+            if interactionNode is not None:
+                interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
         self.placementObserverTag = None
         self.activePlacementRegionId = None
 
@@ -239,7 +272,7 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
                 slicer.app.processEvents()
                 continue
 
-            result = self.logic.segmentOneRegion(
+            results = self.logic.segmentOneRegion(
                 volumeNode,
                 segmentationNode,
                 region,
@@ -248,8 +281,8 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
                 minSizeVoxels=minSizeVoxels,
                 openingRadiusVox=openingRadiusVox,
             )
-            widgets["statusLabel"].setText(self.logic.describeResult(result))
-            if not result.success:
+            widgets["statusLabel"].setText(self.logic.describeResults(results))
+            if not any(r.success for r in results):
                 anyFailure = True
 
             self.ui.progressBar.value = i + 1
@@ -308,9 +341,9 @@ class SinusSegmentationLogic(ScriptedLoadableModuleLogic):
     def __init__(self):
         ScriptedLoadableModuleLogic.__init__(self)
 
-    def ijkFromFiducial(self, volumeNode, fiducialNode):
+    def ijkFromFiducial(self, volumeNode, fiducialNode, pointIndex=0):
         ras = [0.0, 0.0, 0.0]
-        fiducialNode.GetNthControlPointPositionWorld(0, ras)
+        fiducialNode.GetNthControlPointPositionWorld(pointIndex, ras)
 
         rasToIjk = vtk.vtkMatrix4x4()
         volumeNode.GetRASToIJKMatrix(rasToIjk)
@@ -321,44 +354,62 @@ class SinusSegmentationLogic(ScriptedLoadableModuleLogic):
                           huRange=DEFAULT_HU_RANGE,
                           minSizeVoxels=DEFAULT_MIN_SIZE_VOXELS,
                           openingRadiusVox=DEFAULT_OPENING_RADIUS_VOX):
+        """Runs region growing from every seed placed for this region (a
+        sinus like the ethmoid complex is several separate air cells, so it
+        commonly needs more than one seed) and writes the union of all
+        resulting masks into one segment. Returns the per-seed results."""
         volumeArray = slicer.util.arrayFromVolume(volumeNode)  # array axes are (k, j, i)
         spacingIJK = volumeNode.GetSpacing()  # (sx, sy, sz)
         spacingKJI = (spacingIJK[2], spacingIJK[1], spacingIJK[0])
 
-        i, j, k = self.ijkFromFiducial(volumeNode, fiducialNode)
-        seedKJI = (k, j, i)
+        combinedMask = np.zeros(volumeArray.shape, dtype=bool)
+        results = []
+        for pointIndex in range(fiducialNode.GetNumberOfControlPoints()):
+            i, j, k = self.ijkFromFiducial(volumeNode, fiducialNode, pointIndex)
+            seedKJI = (k, j, i)
 
-        result = segment_region(
-            volume_hu=volumeArray,
-            spacing_mm=spacingKJI,
-            seed_index=seedKJI,
-            hu_range=huRange,
-            crop_radius_mm=region.crop_radius_mm,
-            min_size_voxels=minSizeVoxels,
-            opening_radius_vox=openingRadiusVox,
-        )
+            result = segment_region(
+                volume_hu=volumeArray,
+                spacing_mm=spacingKJI,
+                seed_index=seedKJI,
+                hu_range=huRange,
+                crop_radius_mm=region.crop_radius_mm,
+                min_size_voxels=minSizeVoxels,
+                opening_radius_vox=openingRadiusVox,
+            )
+            results.append(result)
+            if result.mask.any():
+                combinedMask |= result.mask
 
-        if result.mask.any():
+        if combinedMask.any():
             segmentation = segmentationNode.GetSegmentation()
             segmentId = segmentation.GetSegmentIdBySegmentName(region.name_tr)
             if not segmentId:
                 segmentId = segmentation.AddEmptySegment(region.id, region.name_tr, region.color_rgb)
             slicer.util.updateSegmentBinaryLabelmapFromArray(
-                result.mask.astype("uint8"), segmentationNode, segmentId, volumeNode
+                combinedMask.astype("uint8"), segmentationNode, segmentId, volumeNode
             )
 
-        return result
+        return results
 
-    def describeResult(self, result):
-        if result.success:
-            return f"OK  {result.volume_cm3:.2f} cm3"
-        reasons = {
-            "seed_outside_bounds": "tohum hacim dışında",
-            "seed_not_in_air": "tohum hava içinde değil",
-            "too_small": f"çok küçük ({result.volume_voxels} voksel)",
-            "possible_leak": f"olası sızıntı ({result.volume_cm3:.1f} cm3)",
-        }
-        return reasons.get(result.reason, result.reason or "başarısız")
+    def describeResults(self, results):
+        if not results:
+            return "tohum yok"
+
+        numOk = sum(1 for r in results if r.success)
+        total = len(results)
+        if numOk == total:
+            return f"OK ({total} tohum)"
+        if numOk == 0:
+            reasons = {
+                "seed_outside_bounds": "tohum hacim dışında",
+                "seed_not_in_air": "tohum hava içinde değil",
+                "too_small": "çok küçük",
+                "possible_leak": "olası sızıntı",
+            }
+            firstReason = reasons.get(results[0].reason, results[0].reason or "başarısız")
+            return f"başarısız (0/{total}: {firstReason})"
+        return f"kısmen OK ({numOk}/{total})"
 
     def computeStatistics(self, segmentationNode):
         """Returns a list of (segmentName, volume_cm3, surface_mm2) tuples,
@@ -437,8 +488,10 @@ class SinusSegmentationTest(ScriptedLoadableModuleTest):
 
         logic = SinusSegmentationLogic()
         region = SINUS_REGIONS[0]
-        result = logic.segmentOneRegion(volumeNode, segmentationNode, region, fiducialNode)
+        results = logic.segmentOneRegion(volumeNode, segmentationNode, region, fiducialNode)
 
+        self.assertEqual(len(results), 1)
+        result = results[0]
         self.assertTrue(result.success, f"segmentation failed: {result.reason}")
 
         radiusMm = cavityRadiusVox * spacing[0]
