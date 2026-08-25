@@ -69,20 +69,32 @@ def _nearest_air_voxel(air_mask: np.ndarray, seed_local: Sequence[int],
     return None
 
 
-def _component_at_opening(air_mask, seed_local, opening_radius):
+def _component_at_opening(air_mask, seed_local, opening_radius, spacing_mm):
     """Applies plain morphological opening (erosion then dilation by the same
     amount -- NOT reconstruction/propagation, which would just flood right
     back through whatever neck the erosion severed) and returns the labeled
-    component touching the seed, or None if the seed isn't in it at this
-    opening radius."""
+    component touching the seed, or None if no component can be associated
+    with the seed at this opening radius.
+
+    Opening can erode away the seed's own voxel (common for a seed placed
+    near a narrower part of a cavity, e.g. sphenoid/ethmoid), so this looks
+    for the nearest still-present air voxel within the opened mask before
+    giving up -- the same recovery used for the original (unopened) mask.
+    """
     if opening_radius == 0:
         opened = air_mask
     else:
         opened = ndimage.binary_opening(air_mask, iterations=opening_radius)
-    if not opened[seed_local]:
-        return None
+
+    local_seed = seed_local
+    if not opened[local_seed]:
+        found = _nearest_air_voxel(opened, seed_local, spacing_mm, SEED_SEARCH_RADIUS_MM)
+        if found is None:
+            return None
+        local_seed = found
+
     labeled, _ = ndimage.label(opened, structure=np.ones((3, 3, 3), dtype=int))
-    component_label = labeled[seed_local]
+    component_label = labeled[local_seed]
     if component_label == 0:
         return None
     return labeled == component_label
@@ -143,7 +155,7 @@ def segment_region(
     best_reason = None
 
     for radius in range(0, opening_radius_vox + 1):
-        component_mask = _component_at_opening(air_mask, seed_local, radius)
+        component_mask = _component_at_opening(air_mask, seed_local, radius, spacing_mm)
         if component_mask is None:
             continue
 

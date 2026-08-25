@@ -98,5 +98,35 @@ def main():
     print("OK: synthetic phantom test passed")
 
 
+def test_seed_near_boundary_survives_opening():
+    """Regression test: a seed placed right at the cavity's edge can get
+    eroded away by morphological opening during escalation. segment_region
+    must recover (via nearest-air-voxel search inside the opened mask) and
+    still return close to the full cavity volume, not fail or return a
+    much-shrunk result. A prior version of this function silently gave up
+    and skipped straight to a more aggressive (more eroded) radius instead."""
+    volume = build_phantom()
+    edge_seed = (CENTER[0], CENTER[1], CENTER[2] - CAVITY_RADIUS_VOX + 1)
+    assert volume[edge_seed] < -300, "test setup: seed should start inside the air cavity"
+
+    result = segment_region(
+        volume_hu=volume,
+        spacing_mm=SPACING_MM,
+        seed_index=edge_seed,
+        crop_radius_mm=25.0,
+        min_size_voxels=1000,
+        opening_radius_vox=3,
+    )
+
+    expected_cm3 = analytic_volume_cm3()
+    print(f"edge-seed test: success={result.success} volume_cm3={result.volume_cm3:.3f} "
+          f"expected_cm3={expected_cm3:.3f}")
+    assert result.success, f"segmentation failed: {result.reason}"
+    rel_error = abs(result.volume_cm3 - expected_cm3) / expected_cm3
+    assert rel_error < 0.15, f"edge seed lost too much volume (relative_error={rel_error:.1%})"
+    print("OK: edge-seed regression test passed")
+
+
 if __name__ == "__main__":
     main()
+    test_seed_near_boundary_survives_opening()
