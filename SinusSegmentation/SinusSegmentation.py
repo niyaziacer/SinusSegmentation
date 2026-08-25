@@ -423,8 +423,15 @@ class SinusSegmentationLogic(ScriptedLoadableModuleLogic):
 
         segStatLogic = SegmentStatistics.SegmentStatisticsLogic()
         segStatLogic.getParameterNode().SetParameter("Segmentation", segmentationNode.GetID())
-        segStatLogic.getParameterNode().SetParameter("LabelmapSegmentStatistics.enabled", str(True))
-        segStatLogic.getParameterNode().SetParameter("ClosedSurfaceSegmentStatistics.enabled", str(True))
+        # Plugin-enable parameter names have varied across Slicer versions;
+        # try the ones we know of, but don't rely on any one of them -- the
+        # lookup below searches by stat-key suffix instead of exact key, so
+        # it works even if a particular plugin is already enabled by default.
+        for pluginName in ("LabelmapSegmentStatistics", "ClosedSurfaceSegmentStatistics"):
+            try:
+                segStatLogic.getParameterNode().SetParameter(f"{pluginName}.enabled", str(True))
+            except Exception:
+                pass
         segStatLogic.computeStatistics()
         stats = segStatLogic.getStatistics()
 
@@ -432,10 +439,26 @@ class SinusSegmentationLogic(ScriptedLoadableModuleLogic):
         for segmentId in stats.get("SegmentIDs", []):
             segment = segmentationNode.GetSegmentation().GetSegment(segmentId)
             name = segment.GetName() if segment else segmentId
-            volumeCm3 = stats.get((segmentId, "LabelmapSegmentStatistics.volume_cm3"))
-            surfaceMm2 = stats.get((segmentId, "ClosedSurfaceSegmentStatistics.surface_mm2"))
+            volumeCm3 = self._findStatBySuffix(stats, segmentId, "volume_cm3")
+            surfaceMm2 = self._findStatBySuffix(stats, segmentId, "surface_mm2")
             rows.append((name, volumeCm3, surfaceMm2))
+
+        if rows and all(v is None and s is None for _, v, s in rows):
+            logging.warning(
+                "SinusSegmentation: no volume/surface stats matched; available "
+                "SegmentStatistics keys: %s", sorted(k[1] for k in stats if isinstance(k, tuple))
+            )
         return rows
+
+    @staticmethod
+    def _findStatBySuffix(stats, segmentId, keySuffix):
+        """stats is keyed by (segmentId, statKey) tuples, but the exact
+        statKey prefix (which plugin produced it) isn't guaranteed across
+        Slicer versions, so match on suffix instead of the full key."""
+        for key, value in stats.items():
+            if isinstance(key, tuple) and len(key) == 2 and key[0] == segmentId and key[1].endswith(keySuffix):
+                return value
+        return None
 
 
 #
