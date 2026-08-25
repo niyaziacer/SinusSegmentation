@@ -96,13 +96,13 @@
        </widget>
       </item>
       <item row="3" column="0">
-       <widget class="QLabel" name="openingRadiusLabel"><property name="text"><string>Morfolojik açma yarıçapı (voksel):</string></property></widget>
+       <widget class="QLabel" name="openingRadiusLabel"><property name="text"><string>Maks. morfolojik açma yarıçapı (voksel, gerektiğinde kademeli artar):</string></property></widget>
       </item>
       <item row="3" column="1">
        <widget class="QSpinBox" name="openingRadiusSpinBox">
         <property name="minimum"><number>0</number></property>
         <property name="maximum"><number>5</number></property>
-        <property name="value"><number>1</number></property>
+        <property name="value"><number>3</number></property>
        </widget>
       </item>
      </layout>

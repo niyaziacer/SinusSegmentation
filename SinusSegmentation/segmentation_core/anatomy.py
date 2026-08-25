@@ -40,7 +40,11 @@ SINUS_REGIONS = (
 # Default air-cavity Hounsfield range and morphology parameters.
 DEFAULT_HU_RANGE = (-1024.0, -300.0)
 DEFAULT_MIN_SIZE_VOXELS = 1000
-DEFAULT_OPENING_RADIUS_VOX = 1
+# This is a ceiling, not a fixed amount applied to every region: segment_region
+# escalates opening one voxel at a time and stops as soon as the result no
+# longer looks like a leak, so raising this only helps genuinely patent/leaky
+# cases without costing volume accuracy on well-contained ones.
+DEFAULT_OPENING_RADIUS_VOX = 3
 DEFAULT_LEAK_VOLUME_CM3 = 30.0
 
 

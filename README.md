@@ -26,14 +26,25 @@ For each sinus, given one seed point placed inside its air cavity:
    CT where 15 mm let ethmoid growth leak into the nasal cavity, see
    `scripts/find_candidates.py`).
 2. Threshold the crop to an air HU range (default −1024…−300).
-3. Morphological opening to sever thin ostium/nasal-cavity connections.
-4. Connected-component labeling; keep only the component touching the seed.
+3. Connected-component labeling on the *unopened* mask; keep only the
+   component touching the seed.
+4. If that component's volume looks like a leak (over ~30 cm³), retry with
+   morphological opening, escalating the radius by one voxel at a time (up
+   to a configurable ceiling) until the result is no longer leak-sized, then
+   stop — the gentlest opening that works is kept. Real CT air/bone
+   boundaries are irregular at the voxel scale, so opening every region by a
+   fixed amount (the original design) erodes true boundary detail a uniform
+   re-dilation can't recover: on real data this cost 30-45% of the true
+   volume even for cavities that never needed any opening at all, because
+   the crop alone already prevented them from leaking. Escalating only when
+   actually needed avoids that cost in the common case.
 5. Reject the result if it's smaller than a minimum size (default 1000
    voxels, matching manual "Islands" filtering) — reported as a failed seed
    rather than silently accepted.
 6. Morphological closing + hole-filling to smooth the kept region.
-7. Flag (don't silently accept) results larger than ~30 cm³ as a possible
-   leak, as a belt-and-suspenders check on top of step 1's geometric guard.
+7. Flag (don't silently accept) results still larger than ~30 cm³ after
+   exhausting the opening ceiling, as a belt-and-suspenders check on top of
+   step 1's geometric guard.
 
 The algorithm itself (`SinusSegmentation/segmentation_core/`) is plain
 numpy/scipy with no Slicer dependency, so it's unit-testable outside Slicer —

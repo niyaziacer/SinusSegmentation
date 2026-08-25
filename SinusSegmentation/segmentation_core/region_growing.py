@@ -9,10 +9,13 @@ leaks through that ostium and merges the sinus with all exterior air into one
 component. This module avoids that geometrically: growing only happens
 inside a small crop around the seed point, so it can never reach exterior
 air in the first place. A morphological opening additionally severs any
-thin neck that survives within the crop before labeling.
+thin neck that survives within the crop before labeling -- but only as much
+opening as is actually needed (see segment_region), since real CT air/bone
+boundaries are irregular at the voxel scale and every extra bit of opening
+erodes true boundary detail that a uniform-radius re-dilation can't recover.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
@@ -66,6 +69,25 @@ def _nearest_air_voxel(air_mask: np.ndarray, seed_local: Sequence[int],
     return None
 
 
+def _component_at_opening(air_mask, seed_local, opening_radius):
+    """Applies plain morphological opening (erosion then dilation by the same
+    amount -- NOT reconstruction/propagation, which would just flood right
+    back through whatever neck the erosion severed) and returns the labeled
+    component touching the seed, or None if the seed isn't in it at this
+    opening radius."""
+    if opening_radius == 0:
+        opened = air_mask
+    else:
+        opened = ndimage.binary_opening(air_mask, iterations=opening_radius)
+    if not opened[seed_local]:
+        return None
+    labeled, _ = ndimage.label(opened, structure=np.ones((3, 3, 3), dtype=int))
+    component_label = labeled[seed_local]
+    if component_label == 0:
+        return None
+    return labeled == component_label
+
+
 def segment_region(
     volume_hu: np.ndarray,
     spacing_mm: Sequence[float],
@@ -81,6 +103,13 @@ def segment_region(
     volume_hu: 3D numpy array of Hounsfield units.
     spacing_mm: per-axis voxel spacing (mm), in the same axis order as volume_hu.
     seed_index: integer (a0, a1, a2) index into volume_hu, in the same axis order.
+
+    Escalates morphological opening one voxel at a time, from none up to
+    opening_radius_vox, stopping as soon as a radius no longer looks like a
+    leak (grown volume under leak_volume_cm3). This keeps the most true
+    volume for the (common) case where the crop alone already prevents
+    leaking, while still cutting a real thin connection (e.g. a patent
+    ostium) when a gentler radius doesn't stop it.
     """
     shape = volume_hu.shape
     seed_index = tuple(int(v) for v in seed_index)
@@ -97,13 +126,10 @@ def segment_region(
     seed_local = tuple(seed_index[a] - lo[a] for a in range(3))
 
     air_mask = (crop >= hu_range[0]) & (crop <= hu_range[1])
+    voxel_volume_mm3 = float(np.prod(spacing_mm))
 
-    opened = air_mask
-    if opening_radius_vox > 0:
-        opened = ndimage.binary_opening(air_mask, iterations=opening_radius_vox)
-
-    if not opened[seed_local]:
-        found = _nearest_air_voxel(opened, seed_local, spacing_mm, SEED_SEARCH_RADIUS_MM)
+    if not air_mask[seed_local]:
+        found = _nearest_air_voxel(air_mask, seed_local, spacing_mm, SEED_SEARCH_RADIUS_MM)
         if found is None:
             return RegionGrowingResult(
                 mask=np.zeros(shape, dtype=bool), success=False,
@@ -112,48 +138,55 @@ def segment_region(
             )
         seed_local = found
 
-    labeled, _ = ndimage.label(opened, structure=np.ones((3, 3, 3), dtype=int))
-    component_label = labeled[seed_local]
-    if component_label == 0:
+    best_filled = None
+    best_voxels = 0
+    best_reason = None
+
+    for radius in range(0, opening_radius_vox + 1):
+        component_mask = _component_at_opening(air_mask, seed_local, radius)
+        if component_mask is None:
+            continue
+
+        raw_voxels = int(component_mask.sum())
+        if raw_voxels < min_size_voxels:
+            if best_filled is None:
+                best_reason = "too_small"
+                best_voxels = raw_voxels
+            continue
+
+        closed = ndimage.binary_closing(component_mask, iterations=radius + 1)
+        filled = ndimage.binary_fill_holes(closed)
+        voxels = int(filled.sum())
+        volume_cm3 = voxels * voxel_volume_mm3 / 1000.0
+
+        best_filled = filled
+        best_voxels = voxels
+        best_reason = "possible_leak" if volume_cm3 > leak_volume_cm3 else None
+        if best_reason is None:
+            break  # gentlest non-leaking opening found -- stop eroding further
+
+    if best_filled is None:
         return RegionGrowingResult(
             mask=np.zeros(shape, dtype=bool), success=False,
-            reason="seed_not_in_air",
-            seed_index_used=tuple(seed_index), bbox=(lo, hi),
-        )
-
-    component_mask = labeled == component_label
-    voxel_volume_mm3 = float(np.prod(spacing_mm))
-    raw_voxels = int(component_mask.sum())
-
-    if raw_voxels < min_size_voxels:
-        return RegionGrowingResult(
-            mask=np.zeros(shape, dtype=bool), success=False,
-            reason="too_small",
+            reason=best_reason or "seed_not_in_air",
             seed_index_used=tuple(lo[a] + seed_local[a] for a in range(3)), bbox=(lo, hi),
-            volume_voxels=raw_voxels,
-            volume_mm3=raw_voxels * voxel_volume_mm3,
-            volume_cm3=raw_voxels * voxel_volume_mm3 / 1000.0,
+            volume_voxels=best_voxels,
+            volume_mm3=best_voxels * voxel_volume_mm3,
+            volume_cm3=best_voxels * voxel_volume_mm3 / 1000.0,
         )
-
-    closed = ndimage.binary_closing(component_mask, iterations=opening_radius_vox + 1)
-    filled = ndimage.binary_fill_holes(closed)
-
-    final_voxels = int(filled.sum())
-    volume_mm3 = final_voxels * voxel_volume_mm3
-    volume_cm3 = volume_mm3 / 1000.0
 
     mask_full = np.zeros(shape, dtype=bool)
-    mask_full[crop_slices] = filled
-
-    reason = "possible_leak" if volume_cm3 > leak_volume_cm3 else None
+    mask_full[crop_slices] = best_filled
+    volume_mm3 = best_voxels * voxel_volume_mm3
+    volume_cm3 = volume_mm3 / 1000.0
 
     return RegionGrowingResult(
         mask=mask_full,
-        success=reason is None,
-        reason=reason,
+        success=best_reason is None,
+        reason=best_reason,
         seed_index_used=tuple(lo[a] + seed_local[a] for a in range(3)),
         bbox=(lo, hi),
-        volume_voxels=final_voxels,
+        volume_voxels=best_voxels,
         volume_mm3=volume_mm3,
         volume_cm3=volume_cm3,
     )
