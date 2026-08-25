@@ -1,6 +1,8 @@
 import csv
 import logging
 import os
+import zipfile
+from xml.sax.saxutils import escape
 
 import numpy as np
 import qt
@@ -22,6 +24,80 @@ from segmentation_core.anatomy import (
     SINUS_REGIONS,
 )
 from segmentation_core.region_growing import segment_region
+
+
+def _xlsxCellXml(colIndex, rowIndex, value):
+    col = ""
+    n = colIndex
+    while True:
+        col = chr(ord("A") + n % 26) + col
+        n = n // 26 - 1
+        if n < 0:
+            break
+    ref = f"{col}{rowIndex}"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c r="{ref}"><v>{value}</v></c>'
+    text = escape("" if value is None else str(value))
+    return f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+
+
+def writeXlsx(path, headers, rows):
+    """Writes a minimal single-sheet .xlsx file using only the standard
+    library (zipfile + hand-written OOXML), so no extra Python package needs
+    to be installed in Slicer's Python environment."""
+    sheetRowsXml = []
+    allRows = [headers] + list(rows)
+    for rowIndex, row in enumerate(allRows, start=1):
+        cells = "".join(_xlsxCellXml(colIndex, rowIndex, value) for colIndex, value in enumerate(row))
+        sheetRowsXml.append(f'<row r="{rowIndex}">{cells}</row>')
+
+    sheetXml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(sheetRowsXml)}</sheetData>'
+        "</worksheet>"
+    )
+    contentTypesXml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        "</Types>"
+    )
+    rootRelsXml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+    workbookXml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Sonuclar" sheetId="1" r:id="rId1"/></sheets>'
+        "</workbook>"
+    )
+    workbookRelsXml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/>'
+        "</Relationships>"
+    )
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", contentTypesXml)
+        z.writestr("_rels/.rels", rootRelsXml)
+        z.writestr("xl/workbook.xml", workbookXml)
+        z.writestr("xl/_rels/workbook.xml.rels", workbookRelsXml)
+        z.writestr("xl/worksheets/sheet1.xml", sheetXml)
 
 
 #
@@ -118,8 +194,9 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
             seedButton = qt.QPushButton("Tohum yerleştir")
             seedButton.setCheckable(True)
             seedButton.setToolTip(
-                "Birden fazla kez tıklayarak birden fazla tohum ekleyebilirsin "
-                "(örn. etmoid gibi tek parça olmayan sinüsler için)."
+                "Bir tohum eklemek için bas ve görünümde bir kez tıkla. Aynı bölgeye "
+                "başka bir tohum daha eklemek istersen (örn. etmoid gibi tek parça "
+                "olmayan sinüsler için) butona tekrar bas."
             )
 
             clearButton = qt.QPushButton("Temizle")
@@ -193,9 +270,11 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
         selectionNode = slicer.mrmlScene.GetNodeByID("vtkMRMLSelectionNodeSingleton")
         selectionNode.SetActivePlaceNodeID(fiducialNode.GetID())
         interactionNode = slicer.mrmlScene.GetNodeByID("vtkMRMLInteractionNodeSingleton")
-        # Persistent placement: stay in "place" mode after each click, so the
-        # user can add several seeds for one region without re-arming the button.
-        interactionNode.SetPlaceModePersistence(1)
+        # One click, one point: persistent placement let stray clicks (e.g. in
+        # a different slice view while navigating) silently add extra, wrong
+        # seeds. To add another seed for the same region, click the button
+        # again -- existing seeds for the region are kept, not cleared.
+        interactionNode.SetPlaceModePersistence(0)
         interactionNode.SetCurrentInteractionMode(interactionNode.Place)
 
         self._updateSeedCountLabel(regionId)
@@ -205,6 +284,9 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
         if regionId is None:
             return
         self._updateSeedCountLabel(regionId)
+        widgets = self.regionWidgets[regionId]
+        widgets["seedButton"].setChecked(False)
+        self._stopSeedPlacement()
 
     def _updateSeedCountLabel(self, regionId):
         widgets = self.regionWidgets[regionId]
@@ -320,17 +402,29 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
             return
 
         path = qt.QFileDialog.getSaveFileName(
-            self.parent, "CSV olarak kaydet", "sinus_sonuclari.csv", "CSV files (*.csv)"
+            self.parent, "Sonuçları kaydet (CSV + Excel)", "sinus_results.csv", "CSV files (*.csv)"
         )
         if not path:
             return
 
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["sinus", "volume_cm3", "surface_mm2"])
-            writer.writerows(self.lastResultsRows)
+        nameToEnglish = {region.name_tr: region.name_en for region in SINUS_REGIONS}
+        exportRows = [
+            (nameToEnglish.get(name, name), volumeCm3, surfaceMm2)
+            for name, volumeCm3, surfaceMm2 in self.lastResultsRows
+        ]
+        headers = ["sinus", "volume_cm3", "surface_mm2"]
 
-        slicer.util.infoDisplay(f"Kaydedildi: {path}")
+        csvPath = path if path.lower().endswith(".csv") else path + ".csv"
+        xlsxPath = os.path.splitext(csvPath)[0] + ".xlsx"
+
+        with open(csvPath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            writer.writerows(exportRows)
+
+        writeXlsx(xlsxPath, headers, exportRows)
+
+        slicer.util.infoDisplay(f"Kaydedildi:\n{csvPath}\n{xlsxPath}")
 
 
 #
@@ -421,13 +515,22 @@ class SinusSegmentationLogic(ScriptedLoadableModuleLogic):
         hand-rolled marching-cubes pass."""
         import SegmentStatistics
 
+        # The closed-surface representation is what the surface-area plugin
+        # measures; make sure it actually exists rather than assuming the
+        # plugin will create it on demand.
+        if not segmentationNode.GetSegmentation().ContainsRepresentation("Closed surface"):
+            segmentationNode.CreateClosedSurfaceRepresentation()
+
         segStatLogic = SegmentStatistics.SegmentStatisticsLogic()
         segStatLogic.getParameterNode().SetParameter("Segmentation", segmentationNode.GetID())
         # Plugin-enable parameter names have varied across Slicer versions;
-        # try the ones we know of, but don't rely on any one of them -- the
+        # try every spelling we know of rather than relying on one -- the
         # lookup below searches by stat-key suffix instead of exact key, so
         # it works even if a particular plugin is already enabled by default.
-        for pluginName in ("LabelmapSegmentStatistics", "ClosedSurfaceSegmentStatistics"):
+        for pluginName in (
+            "LabelmapSegmentStatistics", "LabelmapSegmentStatisticsPlugin",
+            "ClosedSurfaceSegmentStatistics", "ClosedSurfaceSegmentStatisticsPlugin",
+        ):
             try:
                 segStatLogic.getParameterNode().SetParameter(f"{pluginName}.enabled", str(True))
             except Exception:
@@ -443,10 +546,11 @@ class SinusSegmentationLogic(ScriptedLoadableModuleLogic):
             surfaceMm2 = self._findStatBySuffix(stats, segmentId, "surface_mm2")
             rows.append((name, volumeCm3, surfaceMm2))
 
-        if rows and all(v is None and s is None for _, v, s in rows):
+        if rows and any(v is None or s is None for _, v, s in rows):
             logging.warning(
-                "SinusSegmentation: no volume/surface stats matched; available "
-                "SegmentStatistics keys: %s", sorted(k[1] for k in stats if isinstance(k, tuple))
+                "SinusSegmentation: some volume/surface stats did not match; "
+                "available SegmentStatistics keys: %s",
+                sorted({k[1] for k in stats if isinstance(k, tuple)}),
             )
         return rows
 

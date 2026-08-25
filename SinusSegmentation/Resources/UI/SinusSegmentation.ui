@@ -134,7 +134,7 @@
       </item>
       <item>
        <widget class="QPushButton" name="exportCsvButton">
-        <property name="text"><string>CSV olarak dışa aktar</string></property>
+        <property name="text"><string>CSV + Excel olarak dışa aktar</string></property>
         <property name="enabled"><bool>false</bool></property>
        </widget>
       </item>
