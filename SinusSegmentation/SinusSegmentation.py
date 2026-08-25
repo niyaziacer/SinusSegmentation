@@ -160,7 +160,7 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
                 "vtkMRMLMarkupsFiducialNode", f"seed_{regionId}"
             )
             fiducialNode.SetMaximumNumberOfControlPoints(1)
-            fiducialNode.CreateDefaultDisplayNode()
+            fiducialNode.CreateDefaultDisplayNodes()
             fiducialNode.GetDisplayNode().SetSelectedColor(*widgets["region"].color_rgb)
             widgets["fiducialNode"] = fiducialNode
         else:
