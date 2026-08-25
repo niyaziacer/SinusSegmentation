@@ -76,6 +76,10 @@ class SinusSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
         uiWidget.setMRMLScene(slicer.mrmlScene)
+        # Explicitly (re)set the scene on each node selector too: relying only
+        # on the root qMRMLWidget to cascade it down has been unreliable here.
+        self.ui.inputVolumeSelector.setMRMLScene(slicer.mrmlScene)
+        self.ui.segmentationSelector.setMRMLScene(slicer.mrmlScene)
 
         self.logic = SinusSegmentationLogic()
 
