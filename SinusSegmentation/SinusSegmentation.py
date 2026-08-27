@@ -484,6 +484,7 @@ class SinusSegmentationLogic(ScriptedLoadableModuleLogic):
                 crop_radius_mm=region.crop_radius_mm,
                 min_size_voxels=minSizeVoxels,
                 opening_radius_vox=openingRadiusVox,
+                leak_volume_cm3=region.leak_volume_cm3,
             )
             results.append(result)
             if result.mask.any():
