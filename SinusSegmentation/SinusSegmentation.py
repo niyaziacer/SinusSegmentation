@@ -1,6 +1,7 @@
 import csv
 import logging
 import os
+import sys
 import zipfile
 from xml.sax.saxutils import escape
 
@@ -16,6 +17,15 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleWidget,
 )
 from slicer.util import VTKObservationMixin
+
+# Slicer's module "Reload" button only re-executes this file; a package it
+# imports (segmentation_core) stays cached in sys.modules from the first
+# load, so edits to it would otherwise need a full Slicer restart to take
+# effect. Purge it here so every (re)load of this file re-reads the package
+# from disk.
+for _modName in list(sys.modules):
+    if _modName == "segmentation_core" or _modName.startswith("segmentation_core."):
+        del sys.modules[_modName]
 
 from segmentation_core.anatomy import (
     DEFAULT_HU_RANGE,
